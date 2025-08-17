@@ -85,15 +85,21 @@ export default function MapView({ tx, setTx, rx, env, hf, pxStep }: Props) {
       ctx.clearRect(0, 0, width, height);
 
       for (const c of cells) {
+        // Hard guard: ignore non-finite values
+        if (!Number.isFinite(c.pr_dBm) || !Number.isFinite(c.margin_dB)) continue;
+      
         // Do not paint below power cutoff
         if (c.pr_dBm < POWER_CUTOFF_DBM) continue;
-        
-        // Map margin window −10..+30 dB → 0..1
-        const t = Math.max(0, Math.min(1, (c.margin_dB - MARGIN_MIN_DB) / (MARGIN_MAX_DB - MARGIN_MIN_DB)));
-        const [r,g,b,a] = viridis(t);
+      
+        const tRaw = (c.margin_dB - MARGIN_MIN_DB) / (MARGIN_MAX_DB - MARGIN_MIN_DB);
+        if (!Number.isFinite(tRaw)) continue;
+      
+        const t = Math.max(0, Math.min(1, tRaw));
+        const [r, g, b, a] = viridis(t);
         ctx.fillStyle = `rgba(${r},${g},${b},${a/255})`;
         ctx.fillRect(c.x, c.y, pxStep, pxStep);
       }
+      
     };
     worker.addEventListener('message', onMsg);
     return () => worker.removeEventListener('message', onMsg);

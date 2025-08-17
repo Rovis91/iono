@@ -56,6 +56,13 @@ export type PathMode = 'IONO' | 'NVIS' | 'GROUND' | 'LOS' | 'NLOS' | 'DIFFRACTIO
 export interface PathResult {
   loss_dB: number;
   mode: PathMode;
+  debug?: {
+    reason?: string;
+    rxPower_dBm?: number;
+    noiseFloor_dBm?: number;
+    snr_dB?: number;
+    skipZone?: boolean;
+  }
 }
 
 export interface LinkResult {

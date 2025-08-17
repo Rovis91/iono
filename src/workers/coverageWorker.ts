@@ -51,22 +51,26 @@ self.onmessage = (e: MessageEvent<CoverageRequest>) => {
 
     for (let py = 0; py < height; py += pxStep) {
       for (let px = 0; px < width; px += pxStep) {
-        const x = xWest + (px / width) * (xEast - xWest);
-        const y = yNorth + (py / height) * (ySouth - yNorth);
-        const { lat, lng } = pointToLatLng(x, y, zoom);
-        const d_km = Math.max(haversine_km(tx.lat, tx.lon, lat, lng), 0.001);
-
-        const ctx: Context = { 
-          distance_km: d_km, 
-          hf: ctxBase?.hf 
-        };
-        const link = predictLink(tx, rx, env, ctx);
-
-        cells.push({ x: px, y: py, margin_dB: link.margin_dB, pr_dBm: link.pr_dBm, mode: link.mode });
-        
-
+        try {
+          const x = xWest + (px / width) * (xEast - xWest);
+          const y = yNorth + (py / height) * (ySouth - yNorth);
+          const { lat, lng } = pointToLatLng(x, y, zoom);
+          const d_km = Math.max(haversine_km(tx.lat, tx.lon, lat, lng), 0.001);
+    
+          const ctx: Context = { distance_km: d_km, ...(ctxBase || {}) };
+          const link = predictLink(tx, rx, env, ctx);
+    
+          const pr = Number.isFinite(link.pr_dBm) ? link.pr_dBm : -Infinity;
+          const m  = Number.isFinite(link.margin_dB) ? link.margin_dB : -Infinity;
+    
+          cells.push({ x: px, y: py, margin_dB: m, pr_dBm: pr, mode: link.mode });
+        } catch (err) {
+          // If anything explodes, just skip this pixel
+          // (optionally collect a counter for diagnostics)
+        }
       }
     }
+    
 
     self.postMessage({ cells, width, height, pxStep } as CoverageResponse);
   } catch (error) {

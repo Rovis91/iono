@@ -1,0 +1,16 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html, body, #root { height: 100%; }
+.leaflet-container { height: 100%; width: 100%; }
+
+/* TX marker */
+.tx-dot { width: 14px; height: 14px; border-radius: 9999px; background: #ef4444; box-shadow: 0 0 0 2px #fff, 0 0 6px rgba(239,68,68,.6); }
+
+/* Ensure canvas is visible and properly positioned */
+canvas {
+  image-rendering: pixelated;
+  image-rendering: -moz-crisp-edges;
+  image-rendering: crisp-edges;
+}

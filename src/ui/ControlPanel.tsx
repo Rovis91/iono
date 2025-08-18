@@ -23,7 +23,7 @@ export default function ControlPanel({ tx, setTx, rx, setRx, env, setEnv, hf, se
       <h3 className="font-semibold">Band & Preset</h3>
       <select
         className="border rounded p-1 w-full"
-        value={presetValue}
+        value={presetValue} 
         onChange={(e) => {
           const label = e.target.value;
           if (label === 'custom') return;
@@ -33,11 +33,11 @@ export default function ControlPanel({ tx, setTx, rx, setRx, env, setEnv, hf, se
           // Apply HF defaults if available
           if (p.foF2_MHz || p.propagationMode) {
             console.log(`Applying HF preset: foF2=${p.foF2_MHz}MHz, mode=${p.propagationMode}`);
-            setHf(prevHf => ({
-              ...prevHf,
+            setHf({
+              ...hf,
               ...(p.foF2_MHz !== undefined && { foF2_MHz: p.foF2_MHz }),
               ...(p.propagationMode !== undefined && { propagationMode: p.propagationMode })
-            }));
+            });
           }
           // Apply RX defaults
           setRx({
@@ -83,14 +83,23 @@ export default function ControlPanel({ tx, setTx, rx, setRx, env, setEnv, hf, se
              {/* HF controls */}
        <div className={`grid grid-cols-2 gap-2 ${isHF ? '' : 'opacity-50 pointer-events-none'}`}>
          <Num label="foF2 (MHz)" value={hf.foF2_MHz} onChange={v=>setHf({ ...hf, foF2_MHz: v })} />
-         <Toggle label="NVIS" checked={nvisApplicable ? hf.NVIS_enabled : false} disabled={!nvisApplicable} onChange={c=>setHf({ ...hf, NVIS_enabled: c })} />
+         <Toggle label="NVIS Enabled" checked={nvisApplicable ? hf.NVIS_enabled : false} disabled={!nvisApplicable} onChange={c=>setHf({ ...hf, NVIS_enabled: c })} />
+         <div className="col-span-2 text-xs text-gray-600">
+           {nvisApplicable ? "NVIS works for ≤7 MHz, ≤500 km. Use 'NVIS Only' mode to force NVIS." : "NVIS only available for ≤7 MHz"}
+         </div>
          <div className="col-span-2">
            <label className="text-xs text-gray-600">Propagation Mode (HF only)</label>
-           <select className="border rounded p-1 w-full" disabled={!isHF} value={hf.propagationMode} onChange={e=>setHf({ ...hf, propagationMode: e.target.value as 'auto' | 'ground' | 'sky' })}>
-             <option value="auto">Auto (Sky-wave → Ground-wave)</option>
-             <option value="ground">Ground-wave only</option>
-             <option value="sky">Sky-wave only</option>
-           </select>
+           <select
+            className="border rounded p-1 w-full"
+            disabled={!isHF}
+            value={hf.propagationMode ?? 'auto'}
+            onChange={e=>setHf({ ...hf, propagationMode: e.target.value as 'auto' | 'ground' | 'sky' | 'nvis' })}
+          >
+            <option value="auto">Auto (NVIS → Sky → Ground)</option>
+            <option value="nvis">NVIS Only (≤7 MHz, ≤500 km)</option>
+            <option value="sky">Sky Wave Only (F2 layer)</option>
+            <option value="ground">Ground Wave Only</option>
+          </select>
          </div>
          <div className="col-span-2">
            <label className="text-xs text-gray-600">Ground class (HF only)</label>

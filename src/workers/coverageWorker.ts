@@ -59,10 +59,11 @@ self.onmessage = (e: MessageEvent<CoverageRequest>) => {
     
           const ctx: Context = { distance_km: d_km, ...(ctxBase || {}) };
           const link = predictLink(tx, rx, env, ctx);
-    
+
+          // Sanitize values before sending to UI
           const pr = Number.isFinite(link.pr_dBm) ? link.pr_dBm : -Infinity;
           const m  = Number.isFinite(link.margin_dB) ? link.margin_dB : -Infinity;
-    
+
           cells.push({ x: px, y: py, margin_dB: m, pr_dBm: pr, mode: link.mode });
         } catch (err) {
           // If anything explodes, just skip this pixel

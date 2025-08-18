@@ -5,229 +5,282 @@
 import { Context, Env, PathResult, Tx, Rx } from '../core/contracts';
 
 /**
- * HF propagation (V1.5):
- * - Ground-wave (simplified ITU-R P.368-style) for MF/low-HF, short ranges.
- * - Sky-wave (F2) with MUF gate + skip-zone + ≤2 hops.
- * - NVIS (optional) with E-layer, high elevation.
- * - Decision tree: NVIS (if enabled & valid) -> Sky-wave (if foF2 set & valid) -> Ground-wave (if valid) -> BLOCKED.
- *
- * Notes:
- * - Loss-only PathResult; SNR/margin handled by predictLink() (EIRP + sensitivity).
- * - All units: distance km, freq MHz, heights km in ionosphere helpers, gains dBi.
+ * HF propagation (Official Equations Implementation)
+ * ------------------------------------------------
+ * Based on HF_EQUATIONS_GUIDE.md
+ * 
+ * Models 3–30 MHz using:
+ *  - Ground-wave: ITU-R P.368-9 model with proper ground factors
+ *  - Sky-wave: MUF-based with correct ionospheric layers
+ *  - NVIS: E-layer with high takeoff angles
+ * 
+ * Decision logic:
+ *   If mode==='ground' → ground-wave only
+ *   If mode==='sky'    → sky-wave only  
+ *   If mode==='nvis'   → NVIS only
+ *   Else 'auto'        → NVIS → Sky → Ground (best available)
  */
 
-/* ---------------------------
- * Shared helpers
- * ---------------------------
- */
+/* ---------------------------------
+ * Constants & Utilities
+ * --------------------------------- */
 
-/** Free-space path loss (FSPL) in dB; d in km, f in MHz */
+const R_EARTH_KM = 6371; // Earth radius in km
+const H_E_KM = 110;      // E-layer height
+const H_F1_KM = 200;     // F1-layer height  
+const H_F2_KM = 300;     // F2-layer height
+
+/** Free-space path loss (dB) */
 function fspl_dB(d_km: number, f_MHz: number): number {
   const dk = Math.max(d_km, 1e-6);
   const fm = Math.max(f_MHz, 1e-6);
   return 32.44 + 20 * Math.log10(dk) + 20 * Math.log10(fm);
 }
 
-/** Clamp utility */
-function clamp(x: number, lo: number, hi: number): number {
-  return Math.max(lo, Math.min(hi, x));
+/** Effective antenna height accounting for Earth curvature */
+function effective_height_m(h_actual_m: number): number {
+  return h_actual_m + Math.pow(h_actual_m, 2) / (2 * R_EARTH_KM * 1000);
 }
 
-/* ---------------------------
- * Ground-wave (simplified)
- * ---------------------------
- *
- * Intended domain:
- * - Frequencies: f ≤ 10 MHz (MF/low-HF)
- * - Ranges: d ≤ 300 km
- *
- * Model:
- *   L_gw(dB) = FSPL(d, f) + k_g(ground) * d_km * sqrt(f_MHz)
- * where:
- *   k_g(sea)=0.02, k_g(wet)=0.05, k_g(dry)=0.08  (empirical V1 heuristic)
- * Lower k_g → lower excess loss (better propagation).
- */
-
-/** Excess-loss slope per ground class (empirical heuristic for V1) */
-function kg_by_ground(ground: Env['groundClass']): number {
-  switch (ground) {
-    case 'sea': return 0.02; // excellent conductivity
-    case 'wet': return 0.05; // good
-    case 'dry':
-    default:    return 0.08; // poor
+/** Takeoff angle calculation based on antenna type and height */
+function takeoff_angle_deg(tx_height_m: number, f_MHz: number, antenna_type: string = 'dipole'): number {
+  const lambda_m = 300 / f_MHz;
+  const h_lambda = Math.max(tx_height_m / lambda_m, 0.01); // Avoid log(0)
+  
+  switch (antenna_type) {
+    case 'vertical':
+      return Math.min(80, 60 + 5 * Math.log10(h_lambda));
+    case 'yagi':
+      return Math.max(10, 30 - 8 * Math.log10(h_lambda));
+    case 'loop':
+      return Math.min(85, 70 + 3 * Math.log10(h_lambda));
+    case 'random':
+      return 30;
+    default: // dipole
+      return Math.max(15, 45 - 10 * Math.log10(h_lambda));
   }
 }
 
-/** Ground-wave validity gate for this simplified model */
-function groundwave_applicable(f_MHz: number, d_km: number): boolean {
-  return f_MHz <= 10 && d_km <= 300;
+/* ---------------------------------
+ * Ground Wave (ITU-R P.368-9)
+ * --------------------------------- */
+
+/** Ground conductivity and permittivity by type */
+const GROUND_PROPERTIES = {
+  sea: { sigma: 5.0, epsilon: 80.0 },
+  wet: { sigma: 0.01, epsilon: 15.0 },
+  dry: { sigma: 0.001, epsilon: 4.0 }
+};
+
+/** Ground factor calculation */
+function ground_factor(groundClass: string, f_MHz: number): number {
+  const props = GROUND_PROPERTIES[groundClass as keyof typeof GROUND_PROPERTIES];
+  if (!props) return 0.1; // default for unknown ground types
+  
+  const sigma = props.sigma;
+  const epsilon = props.epsilon;
+  const f_Hz = f_MHz * 1e6;
+  const epsilon_0 = 8.854e-12;
+  
+  // Ground factor should be higher for better conducting ground
+  // This results in lower path loss for sea vs dry ground
+  return Math.sqrt(sigma / (2 * Math.PI * f_Hz * epsilon * epsilon_0));
 }
 
-/** Ground-wave loss (simplified V1) */
-function groundwave_loss_dB(d_km: number, f_MHz: number, ground: Env['groundClass']): number {
-  if (!groundwave_applicable(f_MHz, d_km)) return Number.POSITIVE_INFINITY;
-  const Lfs = fspl_dB(d_km, f_MHz);
-  const kg = kg_by_ground(ground);
-  const excess = kg * d_km * Math.sqrt(Math.max(f_MHz, 0.0001));
-  return Lfs + excess;
+/** Curvature factor for Earth's curvature */
+function curvature_factor(d_km: number): number {
+  return Math.sqrt(1 + Math.pow(d_km / (2 * R_EARTH_KM), 2));
 }
 
-/* ---------------------------
- * Sky-wave (F2) + skip zone
- * ---------------------------
- *
- * Assumptions (V1.5):
- * - Virtual F2 height h_F2 = 300 km
- * - Takeoff angle α from 2D geometry: α = atan(d / (2 h_F2))
- * - MUF gate: f ≤ foF2 · sec(α)
- * - First-hop skip distance: use a minimum launch α_min ≈ 10° for realism
- *   d_skip ≈ 2 h_F2 tan(α_min)
- * - Hop count N = ceil(d / (2 h_F2 tan α)), capped at N ≤ 2
- * - Per-hop slant: s ≈ 2 h_F2 / sin α
- * - Per-hop loss ≈ FSPL(s) + A_absorb, with A_absorb ∝ sec α · f^(-p)
- *   (use p=2 and a 10 dB scale factor as a simple surrogate)
- * - Add 3 dB per ground reflection (N−1 times)
- */
-
-const H_F2_KM = 300;       // virtual F2 reflection height
-const MIN_TAKEOFF_DEG = 10; // conservative min launch angle for skip estimation
-
-/** Takeoff/elevation angle (radians) from ground range and virtual height */
-function takeoff_angle_rad_from_range(d_km: number, h_km: number): number {
-  return Math.atan(Math.max(d_km, 1e-6) / (2 * Math.max(h_km, 1e-3)));
+/** Height gain factor */
+function height_gain_dB(h_tx_m: number, h_rx_m: number): number {
+  const h_tx_eff = Math.max(h_tx_m, 10);
+  const h_rx_eff = Math.max(h_rx_m, 10);
+  return 20 * Math.log10(h_tx_eff / 10) + 20 * Math.log10(h_rx_eff / 10);
 }
 
-/** MUF via secant law (MHz) */
-function muf_secant_MHz(foF2_MHz: number, alpha_rad: number): number {
-  const sec = 1 / Math.cos(alpha_rad);
-  return foF2_MHz * sec;
+/** Ground wave path loss (ITU-R P.368-9) */
+function groundwave_loss_dB(d_km: number, f_MHz: number, groundClass: string, h_tx_m: number, h_rx_m: number): number {
+  // Ground wave limits: ≤10 MHz, ≤300 km
+  if (f_MHz > 10 || d_km > 300) return Number.POSITIVE_INFINITY;
+  
+  const lambda_km = 300 / f_MHz / 1000;
+  const ground_factor_val = ground_factor(groundClass, f_MHz);
+  const curvature_factor_val = curvature_factor(d_km);
+  const height_gain = height_gain_dB(h_tx_m, h_rx_m);
+  
+  const L_fs = fspl_dB(d_km, f_MHz);
+  // Ground term: higher ground factor = lower loss
+  const ground_term = 20 * Math.log10(1 + Math.pow(d_km / lambda_km, 2) / ground_factor_val * curvature_factor_val);
+  
+  return L_fs + ground_term - height_gain;
 }
 
-/** First-hop skip distance (km) for a minimum useful takeoff angle */
-function first_hop_skip_km(h_km: number, minAlphaDeg = MIN_TAKEOFF_DEG): number {
-  const a = clamp(minAlphaDeg, 1, 30) * Math.PI / 180;
-  return 2 * h_km * Math.tan(a);
+/* ---------------------------------
+ * Sky Wave (Ionospheric)
+ * --------------------------------- */
+
+/** Maximum Usable Frequency calculation */
+function muf_MHz(foF2_MHz: number, takeoff_angle_deg: number): number {
+  const theta_rad = takeoff_angle_deg * Math.PI / 180;
+  return foF2_MHz / Math.cos(theta_rad);
 }
 
-/** Per-hop absorption surrogate (dB) — simple frequency & angle dependence */
-function absorption_per_hop_dB(f_MHz: number, alpha_rad: number): number {
-  const sec = 1 / Math.cos(alpha_rad);
-  // Scale and exponent chosen for plausible behavior; tune as needed
-  return 10 * Math.pow(Math.max(f_MHz, 0.1), -2) * sec;
+/** Hop distance calculation */
+function hop_distance_km(iono_height_km: number, takeoff_angle_deg: number): number {
+  const theta_rad = takeoff_angle_deg * Math.PI / 180;
+  return 2 * iono_height_km * Math.tan(theta_rad);
 }
 
-/** Sky-wave loss with MUF and skip-zone checks; returns PathResult */
-function skywave_loss_dB(d_km: number, f_MHz: number, foF2_MHz: number): PathResult {
-  // Basic domain for this simplified sky-wave
+/** Slant distance calculation */
+function slant_distance_km(ground_distance_km: number, takeoff_angle_deg: number): number {
+  const theta_rad = takeoff_angle_deg * Math.PI / 180;
+  return ground_distance_km / Math.cos(theta_rad);
+}
+
+/** Ionospheric absorption */
+function ionospheric_absorption_dB(f_MHz: number, takeoff_angle_deg: number, layer: 'E' | 'F1' | 'F2'): number {
+  const theta_rad = takeoff_angle_deg * Math.PI / 180;
+  const sec_theta = 1 / Math.cos(theta_rad);
+  
+  // Layer-specific coefficients
+  const K = layer === 'E' ? 12 : layer === 'F1' ? 8 : 6;
+  
+  return K * Math.pow(f_MHz, -2) * sec_theta;
+}
+
+/** Sky wave path loss */
+function skywave_loss_dB(d_km: number, f_MHz: number, foF2_MHz: number, h_tx_m: number): PathResult {
   if (f_MHz > 30 || d_km <= 50 || foF2_MHz <= 0) {
     return { loss_dB: 1e6, mode: 'BLOCKED' };
   }
-
-  const alpha = takeoff_angle_rad_from_range(d_km, H_F2_KM);
-
-  // MUF gate
-  const muf = muf_secant_MHz(foF2_MHz, alpha);
-  if (f_MHz > muf) return { loss_dB: 1e6, mode: 'BLOCKED' };
-
-  // Skip-zone (too short for first hop with a realistic minimum launch angle)
-  const d_skip = first_hop_skip_km(H_F2_KM, MIN_TAKEOFF_DEG);
-  if (d_km < d_skip) return { loss_dB: 1e6, mode: 'BLOCKED' };
-
-  // Hop geometry
-  const hop_range = 2 * H_F2_KM * Math.tan(alpha);
-  const hops = Math.max(1, Math.ceil(d_km / Math.max(hop_range, 1e-3)));
-  if (hops > 2) return { loss_dB: 1e6, mode: 'BLOCKED' };
-
-  // Per-hop slant distance and loss
-  const slant_per_hop_km = (2 * H_F2_KM) / Math.max(Math.sin(alpha), 1e-6);
-  const L_fs_per_hop = fspl_dB(slant_per_hop_km, f_MHz);
-  const A_absorb = absorption_per_hop_dB(f_MHz, alpha);
-
-  let total = hops * (L_fs_per_hop + A_absorb);
-  if (hops > 1) total += (hops - 1) * 3; // 3 dB per ground reflection
-
-  return { loss_dB: total, mode: 'IONO' };
+  
+  // Determine ionospheric layer
+  let layer: 'E' | 'F1' | 'F2';
+  let iono_height_km: number;
+  
+  if (f_MHz <= 7) {
+    layer = 'E';
+    iono_height_km = H_E_KM;
+  } else if (f_MHz <= 10) {
+    layer = 'F1';
+    iono_height_km = H_F1_KM;
+  } else {
+    layer = 'F2';
+    iono_height_km = H_F2_KM;
+  }
+  
+  // Calculate takeoff angle
+  const takeoff_angle = takeoff_angle_deg(h_tx_m, f_MHz);
+  
+  // Check MUF
+  const muf = muf_MHz(foF2_MHz, takeoff_angle);
+  if (f_MHz > muf) {
+    return { loss_dB: 1e6, mode: 'BLOCKED' };
+  }
+  
+  // Calculate hop geometry
+  const hop_dist = hop_distance_km(iono_height_km, takeoff_angle);
+  const hops = Math.ceil(d_km / hop_dist);
+  
+  // Limit to 2 hops for V1
+  if (hops > 2) {
+    return { loss_dB: 1e6, mode: 'BLOCKED' };
+  }
+  
+  // Calculate path loss
+  const slant_dist = slant_distance_km(d_km, takeoff_angle);
+  const L_fs = fspl_dB(slant_dist, f_MHz);
+  const L_iono = ionospheric_absorption_dB(f_MHz, takeoff_angle, layer);
+  
+  // Ground reflection loss for multi-hop
+  const reflection_loss = (hops - 1) * 3; // 3 dB per reflection
+  
+  const total_loss = L_fs + L_iono + reflection_loss;
+  
+  return { loss_dB: total_loss, mode: 'IONO' };
 }
 
-/* ---------------------------
- * NVIS (Near-Vertical) optional
- * ---------------------------
- *
- * Assumptions:
- * - E-layer height h_E ≈ 110 km
- * - Fixed high elevation α ≈ 80°
- * - MUF gate: f ≤ foF2 · sec(α)
- * - Stronger absorption surrogate than sky-wave
- * - Single-hop, valid up to ~500 km
- */
+/* ---------------------------------
+ * NVIS (Near-Vertical Incidence)
+ * --------------------------------- */
 
-const H_E_KM = 110;
-const NVIS_ALPHA_DEG = 80;
-
-function nvis_loss_dB(d_km: number, f_MHz: number, foF2_MHz: number): PathResult {
+/** NVIS path loss */
+function nvis_loss_dB(d_km: number, f_MHz: number, foF2_MHz: number, h_tx_m: number): PathResult {
+  // NVIS criteria: ≤7 MHz, ≤500 km, high takeoff angle
   if (f_MHz > 7 || d_km > 500 || foF2_MHz <= 0) {
     return { loss_dB: 1e6, mode: 'BLOCKED' };
   }
-  const alpha = NVIS_ALPHA_DEG * Math.PI / 180;
-  // MUF gate for near-vertical incidence
-  const muf = muf_secant_MHz(foF2_MHz, alpha);
-  if (f_MHz > muf) return { loss_dB: 1e6, mode: 'BLOCKED' };
-
-  // Single-hop slant distance at fixed α
-  const slant_km = (2 * H_E_KM) / Math.max(Math.sin(alpha), 1e-6);
-  const L_fs = fspl_dB(slant_km, f_MHz);
-
-  // Stronger absorption near D/E layers
-  const A_absorb = 15 * Math.pow(Math.max(f_MHz, 0.1), -2) * (1 / Math.cos(alpha));
-
-  return { loss_dB: L_fs + A_absorb, mode: 'NVIS' };
+  
+  const takeoff_angle = takeoff_angle_deg(h_tx_m, f_MHz);
+  
+  // NVIS requires high takeoff angle (≥75°)
+  if (takeoff_angle < 75) {
+    return { loss_dB: 1e6, mode: 'BLOCKED' };
+  }
+  
+  // Check MUF for E-layer
+  const muf = muf_MHz(foF2_MHz, takeoff_angle);
+  if (f_MHz > muf) {
+    return { loss_dB: 1e6, mode: 'BLOCKED' };
+  }
+  
+  // Calculate NVIS path loss
+  const slant_dist = slant_distance_km(d_km, takeoff_angle);
+  const L_fs = fspl_dB(slant_dist, f_MHz);
+  const L_iono = ionospheric_absorption_dB(f_MHz, takeoff_angle, 'E');
+  
+  // Height gain for NVIS
+  const height_gain = 20 * Math.log10(h_tx_m / 10);
+  
+  const total_loss = L_fs + L_iono - height_gain;
+  
+  return { loss_dB: total_loss, mode: 'NVIS' };
 }
 
-/* ---------------------------
+/* ---------------------------------
  * Public entry point
- * ---------------------------
- */
+ * --------------------------------- */
 
-export function solveHF(tx: Tx, _rx: Rx, env: Env, ctx: Context): PathResult {
+export function solveHF(tx: Tx, rx: Rx, env: Env, ctx: Context): PathResult {
   const f = tx.frequency_MHz;
   const d = Math.max(ctx.distance_km, 0.001);
-
-  // Optional: propagation mode coming from ControlPanel (auto | ground | sky)
-  // If your HFContext type doesn’t include it, add:
-  //   propagationMode?: 'auto' | 'ground' | 'sky'
-  const mode = (ctx.hf as any)?.propagationMode as ('auto'|'ground'|'sky'|undefined);
   const foF2 = ctx.hf?.foF2_MHz ?? 0;
   const nvis = !!ctx.hf?.NVIS_enabled;
+  const mode = ctx.hf?.propagationMode;
 
   // --- Explicit modes first ---
   if (mode === 'ground') {
-    const gw = groundwave_loss_dB(d, f, env.groundClass);
-    return Number.isFinite(gw) ? { loss_dB: gw, mode: 'GROUND' } : { loss_dB: 1e6, mode: 'BLOCKED' };
+    const Lgw = groundwave_loss_dB(d, f, env.groundClass, tx.height_m, rx.height_m);
+    return Number.isFinite(Lgw) ? { loss_dB: Lgw, mode: 'GROUND' } : { loss_dB: 1e6, mode: 'BLOCKED' };
   }
-  if (mode === 'sky') {
-    // NVIS preferred when enabled and in-range
-    if (nvis && f <= 7 && d <= 500 && foF2 > 0) {
-      const res = nvis_loss_dB(d, f, foF2);
-      if (res.mode !== 'BLOCKED' && Number.isFinite(res.loss_dB)) return res;
-    }
-    if (foF2 > 0) {
-      const res = skywave_loss_dB(d, f, foF2);
-      if (res.mode !== 'BLOCKED' && Number.isFinite(res.loss_dB)) return res;
-    }
+
+  if (mode === 'nvis') {
+    const nres = nvis_loss_dB(d, f, foF2, tx.height_m);
+    if (nres.mode !== 'BLOCKED') return nres;
     return { loss_dB: 1e6, mode: 'BLOCKED' };
   }
 
-  // --- Auto (default): NVIS -> Sky -> Ground ---
+  if (mode === 'sky') {
+    const sres = skywave_loss_dB(d, f, foF2, tx.height_m);
+    if (sres.mode !== 'BLOCKED') return sres;
+    return { loss_dB: 1e6, mode: 'BLOCKED' };
+  }
+
+  // --- Auto: NVIS → Sky → Ground ---
   if (nvis && f <= 7 && d <= 500 && foF2 > 0) {
-    const res = nvis_loss_dB(d, f, foF2);
-    if (res.mode !== 'BLOCKED' && Number.isFinite(res.loss_dB)) return res;
+    const nres = nvis_loss_dB(d, f, foF2, tx.height_m);
+    if (nres.mode !== 'BLOCKED') return nres;
   }
+  
   if (foF2 > 0) {
-    const res = skywave_loss_dB(d, f, foF2);
-    if (res.mode !== 'BLOCKED' && Number.isFinite(res.loss_dB)) return res;
+    const sres = skywave_loss_dB(d, f, foF2, tx.height_m);
+    if (sres.mode !== 'BLOCKED') return sres;
   }
-  const gw = groundwave_loss_dB(d, f, env.groundClass);
-  if (Number.isFinite(gw)) return { loss_dB: gw, mode: 'GROUND' };
+  
+  // Ground wave as fallback (doesn't need foF2)
+  const Lgw = groundwave_loss_dB(d, f, env.groundClass, tx.height_m, rx.height_m);
+  if (Number.isFinite(Lgw)) return { loss_dB: Lgw, mode: 'GROUND' };
 
   return { loss_dB: 1e6, mode: 'BLOCKED' };
 }

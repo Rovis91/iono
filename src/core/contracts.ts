@@ -36,9 +36,10 @@ export interface Env {
 }
 
 export interface HFContext {
-  foF2_MHz: number;       // MUF slider (V1) - renamed from MUF_MHz to match spec
+  foF2_MHz: number;      // critical frequency foF2 (MHz)
   NVIS_enabled: boolean; // NVIS hint toggle
-  propagationMode: 'auto' | 'ground' | 'sky'; // New: explicit mode selection
+  /** Optional HF propagation selector; default is 'auto' */
+  propagationMode?: 'auto' | 'ground' | 'sky' | 'nvis';
 }
 
 export interface Context {
